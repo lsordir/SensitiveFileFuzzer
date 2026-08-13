@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -38,11 +40,52 @@ var scanAborted bool = false
 type baselineSignature struct {
 	BodySize    int64
 	ContentType string
+	NormHash    string
+	Body        []byte
 }
 
 // baselines holds the fingerprints of "false" paths probed before scanning.
 // A real hit that matches any of these is treated as a false positive.
 var baselines []baselineSignature
+
+// dirExtBaselines caches a false-path signature per (directory, path-shape)
+// key, gathered lazily the first time a hit in that directory/shape survives
+// the global baseline filter. CDNs/WAFs often vary their soft-404 behavior by
+// path shape (extension, hidden dotfile, depth) — a single global baseline
+// (probed only against a handful of top-level, generic-extension paths)
+// misses that variation, so we reproduce the exact shape of the real request
+// with a random sibling filename in the same directory and compare directly.
+var dirExtBaselines = map[string]*baselineSignature{}
+
+// dynamicTokenRe matches the parts of a response that vary from request to
+// request even when the page is really the same soft-404/WAF/catch-all reply:
+// IPv4 addresses (e.g. an echoed backend "ip"), long hex/numeric runs
+// (timestamps, nonces, request IDs) and any multi-digit number. Neutralizing
+// them lets two such responses hash identically so the baseline comparison
+// still recognizes them as the same page.
+var dynamicTokenRe = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|[0-9a-fA-F]{6,}|\d{2,}`)
+
+// normalizedHash fingerprints a body with dynamic tokens neutralized, so
+// pages that are template-identical but for an embedded nonce still compare
+// equal.
+func normalizedHash(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	normalized := dynamicTokenRe.ReplaceAllString(string(body), "#")
+	// Collapse whitespace runs so cosmetic differences don't change the hash.
+	normalized = strings.Join(strings.Fields(normalized), " ")
+	sum := sha1.Sum([]byte(normalized))
+	return hex.EncodeToString(sum[:])
+}
+
+func sigOf(body []byte, contentType string) baselineSignature {
+	return baselineSignature{
+		BodySize:    int64(len(body)),
+		ContentType: contentType,
+		NormHash:    normalizedHash(body),
+	}
+}
 
 func init() {
 	successlist = make(map[string][]string)
@@ -276,15 +319,19 @@ func checkurl(url string, content string, len string, category string) {
 					// Fetch the real body so we can measure its size accurately
 					// (HEAD often omits Content-Length) and compare it against the
 					// false-positive baseline.
-					bodySize, bodyContentType := fetchBody(url)
+					bodySize, bodyContentType, body := fetchBody(url)
 					if bodyContentType == "" {
 						bodyContentType = respcontetnt
 					}
+					normHash := normalizedHash(body)
 
-					// Discard hits that look identical to a known-false path.
-					if isFalsePositive(bodySize, bodyContentType) {
+					// Discard hits that look like the response a false/random
+					// path returns. If a nonexistent path and this path produce
+					// the same kind of reply, the server answers everything the
+					// same way and this is not a real file.
+					if isFalsePositive(bodySize, bodyContentType, normHash, body) {
 						if !justsuccess {
-							fmt.Printf("False positive (matches baseline) '%s', size=%d, '%s'\n", url, bodySize, bodyContentType)
+							fmt.Printf("False positive (matches false-path baseline) '%s', size=%d, '%s'\n", url, bodySize, bodyContentType)
 						}
 						return
 					}
@@ -341,22 +388,23 @@ func registerTimeout(url string) {
 	}
 }
 
-// fetchBody performs a GET and returns the actual body size (in bytes) and the
-// Content-Type header. Returns (-1, "") if the request fails.
-func fetchBody(url string) (int64, string) {
+// fetchBody performs a GET and returns the actual body size (in bytes), the
+// Content-Type header and the raw body. Returns (-1, "", nil) if the request
+// fails.
+func fetchBody(url string) (int64, string, []byte) {
 	if rateLimiter != nil {
 		<-rateLimiter
 	}
 	resp, err := httpcc.Get(url)
 	if err != nil {
-		return -1, ""
+		return -1, "", nil
 	}
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return -1, resp.Header.Get("Content-Type")
+		return -1, resp.Header.Get("Content-Type"), nil
 	}
-	return int64(len(body)), resp.Header.Get("Content-Type")
+	return int64(len(body)), resp.Header.Get("Content-Type"), body
 }
 
 // randomString returns a random hex string of the given byte length.
@@ -396,7 +444,12 @@ func establishBaseline(address string) {
 		resp.Body.Close()
 
 		if sc == 200 {
-			sig := baselineSignature{BodySize: int64(len(body)), ContentType: ct}
+			sig := baselineSignature{
+				BodySize:    int64(len(body)),
+				ContentType: ct,
+				NormHash:    normalizedHash(body),
+				Body:        body,
+			}
 			if !hasBaseline(sig) {
 				baselines = append(baselines, sig)
 			}
@@ -421,17 +474,30 @@ func hasBaseline(sig baselineSignature) bool {
 	return false
 }
 
-// isFalsePositive reports whether a hit's body size and content-type match any
-// recorded baseline signature closely enough to be considered a false positive.
-// Bodies match when the content-type is identical and the size is within ~2%
-// (or 16 bytes) of the baseline, tolerating tiny dynamic differences.
-func isFalsePositive(bodySize int64, contentType string) bool {
+// isFalsePositive reports whether a hit looks like the response a false/random
+// path returns — i.e. the server answers this path the same way it answers a
+// path that cannot exist. A hit is a false positive when, for some baseline,
+// the content-type matches AND any of these hold:
+//
+//  1. The bodies are identical once dynamic tokens (IPs, numbers, hex runs)
+//     are neutralized — the same page with only a changing value.
+//  2. The bodies are JSON with the same set of keys — a catch-all API that
+//     echoes something like {"status":"OK","ip":...} for every request.
+//  3. The body size is within ~2% (or 16 bytes) of the baseline — a final
+//     fallback for near-identical replies.
+func isFalsePositive(bodySize int64, contentType, normHash string, body []byte) bool {
 	if len(baselines) == 0 || bodySize < 0 {
 		return false
 	}
 	for _, b := range baselines {
 		if !sameContentType(b.ContentType, contentType) {
 			continue
+		}
+		if b.NormHash != "" && b.NormHash == normHash {
+			return true
+		}
+		if sameJSONShape(b.Body, body) {
+			return true
 		}
 		diff := bodySize - b.BodySize
 		if diff < 0 {
@@ -446,6 +512,28 @@ func isFalsePositive(bodySize int64, contentType string) bool {
 		}
 	}
 	return false
+}
+
+// sameJSONShape reports whether both bodies are JSON objects with the same set
+// of top-level keys. This catches catch-all endpoints that return the same
+// structure for every path while varying only the values (e.g. an "ip" field).
+func sameJSONShape(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	var ma, mb map[string]json.RawMessage
+	if json.Unmarshal(a, &ma) != nil || json.Unmarshal(b, &mb) != nil {
+		return false
+	}
+	if len(ma) == 0 || len(ma) != len(mb) {
+		return false
+	}
+	for k := range ma {
+		if _, ok := mb[k]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // sameContentType compares content-type headers ignoring charset/parameters.
